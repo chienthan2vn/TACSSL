@@ -40,6 +40,7 @@ class Config:
 
     # Model
     BACKBONE    = "resnet10t.c3_in1k"
+    PRETRAINED_CKPT = ""       # e.g. "/kaggle/input/your-pretrained-model/supcon_best.pth"
     PROJ_DIM    = 128          # projection head output dim
     FEAT_DIM    = 512          # resnet10t output channels
 
@@ -221,7 +222,12 @@ class CLAFModel(nn.Module):
     def __init__(self, backbone_name, num_classes, feat_dim, proj_dim):
         super().__init__()
         self.encoder    = create_model(backbone_name, pretrained=True, num_classes=0)
+        
         self.classifier = nn.Linear(feat_dim, num_classes)
+        # Khởi tạo trọng số nhỏ để bảo vệ pretrained weights của encoder khỏi bị phá huỷ ở batch đầu tiên
+        self.classifier.weight.data.normal_(mean=0.0, std=0.01)
+        self.classifier.bias.data.zero_()
+        
         self.projector  = ProjectionHead(feat_dim, hidden_dim=feat_dim, out_dim=proj_dim)
 
     def forward(self, x):
@@ -471,6 +477,24 @@ class CLAFTrainer:
             cfg.BACKBONE, self.num_classes, cfg.FEAT_DIM, cfg.PROJ_DIM
         ).to(cfg.DEVICE)
 
+        # Load custom pretrained backbone weights if provided (e.g. SSL pretrained)
+        if getattr(cfg, "PRETRAINED_CKPT", "") and os.path.isfile(cfg.PRETRAINED_CKPT):
+            print(f"🔄 Loading custom pretrained weights from: {cfg.PRETRAINED_CKPT}")
+            ckpt = torch.load(cfg.PRETRAINED_CKPT, map_location=cfg.DEVICE)
+            state_dict = ckpt.get("model", ckpt.get("model_state", ckpt.get("state_dict", ckpt)))
+            
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                k = k.replace("module.", "")
+                # If the checkpoint is from SupCon/MoCo, it might have 'encoder.' prefix
+                if k.startswith("encoder."):
+                    new_state_dict[k.replace("encoder.", "")] = v
+                else:
+                    new_state_dict[k] = v
+                    
+            msg = self.model.encoder.load_state_dict(new_state_dict, strict=False)
+            print(f"  └─ Missing keys: {len(msg.missing_keys)} | Unexpected keys: {len(msg.unexpected_keys)}")
+
         # Momentum encoder (EMA copy, no grad)
         self.ema_model = copy.deepcopy(self.model).to(cfg.DEVICE)
         for p in self.ema_model.parameters():
@@ -664,20 +688,7 @@ class CLAFTrainer:
     @torch.no_grad()
     def evaluate(self, verbose=False):
         """
-        Evaluate on test set using the EMA model (as specified in the paper).
-
-        Returns a dict with:
-            accuracy   – overall top-1 accuracy (%)
-            f1_macro   – macro-averaged F1  (treats every class equally; good for imbalance)
-            f1_weighted– weighted F1        (accounts for class support size)
-            precision  – macro-averaged precision
-            recall     – macro-averaged recall
-        
-        Macro averages are chosen as the primary multi-class metric because PlantDoc
-        is naturally imbalanced: macro F1 penalises poor performance on minority
-        classes more fairly than weighted or micro averages.
-
-        When verbose=True, also prints a per-class classification report.
+        Evaluate on test set using the EMA model.
         """
         self.ema_model.eval()
         all_preds  = []
@@ -700,14 +711,6 @@ class CLAFTrainer:
         f1_wt      = f1_score(all_labels, all_preds, average="weighted", zero_division=0) * 100
         prec       = precision_score(all_labels, all_preds, average="macro", zero_division=0) * 100
         rec        = recall_score(all_labels, all_preds, average="macro",    zero_division=0) * 100
-
-        if verbose:
-            class_names = self.test_ds.classes
-            print("\n" + "─" * 60)
-            print(classification_report(
-                all_labels, all_preds,
-                target_names=class_names, zero_division=0))
-            print("─" * 60)
 
         return dict(accuracy=acc, f1_macro=f1_mac, f1_weighted=f1_wt,
                     precision=prec, recall=rec)
