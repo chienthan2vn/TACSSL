@@ -39,7 +39,7 @@ def parse_option():
                         help='number of training epochs')
 
     # optimization
-    parser.add_argument('--learning_rate', type=float, default=0.1,
+    parser.add_argument('--learning_rate', type=float, default=5.0,
                         help='learning rate')
     parser.add_argument('--lr_decay_epochs', type=str, default='60,75,90',
                         help='where to decay lr, can be a list')
@@ -129,21 +129,21 @@ def set_model(opt):
     ckpt = torch.load(opt.ckpt, map_location='cpu', weights_only=False)
     state_dict = ckpt['model']
 
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        k = k.replace("module.", "")
+        new_state_dict[k] = v
+    state_dict = new_state_dict
+    
+    model.load_state_dict(state_dict)
+
     if torch.cuda.is_available():
         if torch.cuda.device_count() > 1:
             model.encoder = torch.nn.DataParallel(model.encoder)
-        else:
-            new_state_dict = {}
-            for k, v in state_dict.items():
-                k = k.replace("module.", "")
-                new_state_dict[k] = v
-            state_dict = new_state_dict
         model = model.cuda()
         classifier = classifier.cuda()
         criterion = criterion.cuda()
         cudnn.benchmark = True
-
-        model.load_state_dict(state_dict)
     else:
         raise NotImplementedError('This code requires GPU')
 

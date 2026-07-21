@@ -228,6 +228,8 @@ class LinearClassifier(nn.Module):
             del temp_model
 
         self.fc = nn.Linear(feat_dim, num_classes)
+        self.fc.weight.data.normal_(mean=0.0, std=0.01)
+        self.fc.bias.data.zero_()
 
     def forward(self, features):
         return self.fc(features)
