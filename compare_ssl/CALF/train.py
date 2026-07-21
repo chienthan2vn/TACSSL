@@ -13,6 +13,7 @@ import random
 import numpy as np
 from pathlib import Path
 from collections import Counter
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
@@ -410,13 +411,13 @@ def claf_contrastive_loss(e_s, pseudo_labels, conf_scores,
 # SEMANTIC ALIGNMENT LOSS  (from DASO)
 # ──────────────────────────────────────────────
 
-def semantic_alignment_loss(q_hat, p_hat, temperature=0.05):
+def semantic_alignment_loss(q_sem, p_hat):
     """
     Encourage consistency between linear pseudo-label p_hat and
-    similarity-based semantic pseudo-label q_hat.
-    Simple KL: KL(q_hat || p_hat)
+    similarity-based semantic pseudo-label q_sem.
+    Simple KL: KL(q_sem || p_hat)
     """
-    q = F.softmax(q_hat / temperature, dim=-1).detach()
+    q = q_sem.detach()
     p = F.log_softmax(p_hat, dim=-1)
     return F.kl_div(p, q, reduction="batchmean")
 
@@ -427,8 +428,12 @@ def semantic_alignment_loss(q_hat, p_hat, temperature=0.05):
 
 @torch.no_grad()
 def update_ema(online: nn.Module, target: nn.Module, momentum: float):
+    # Update parameters
     for p_o, p_t in zip(online.parameters(), target.parameters()):
         p_t.data.mul_(momentum).add_(p_o.data, alpha=1 - momentum)
+    # Update buffers (like BatchNorm running stats)
+    for b_o, b_t in zip(online.buffers(), target.buffers()):
+        b_t.data.copy_(b_o.data)
 
 
 # ──────────────────────────────────────────────
@@ -470,6 +475,7 @@ class CLAFTrainer:
         self.ema_model = copy.deepcopy(self.model).to(cfg.DEVICE)
         for p in self.ema_model.parameters():
             p.requires_grad_(False)
+        self.ema_model.eval()
 
         # ── Queues ──
         self.feat_queue  = ClassQueue(
@@ -505,7 +511,8 @@ class CLAFTrainer:
 
         metrics = dict(loss=0, loss_cls=0, loss_u=0, loss_c=0, loss_align=0)
 
-        for step in range(total):
+        pbar = tqdm(range(total), desc=f"Epoch {epoch:3d}/{cfg.EPOCHS} [Train]", leave=False)
+        for step in pbar:
             # ── fetch batches ──
             try:
                 x_l, y_l = next(labeled_iter)
@@ -537,20 +544,20 @@ class CLAFTrainer:
                 q_sem            = torch.softmax(q_hat, dim=-1)    # semantic pseudo-label
 
             # ───────────────────────────────────
-            # B. Online encoder: labeled
+            # B & C. Online encoder: Single forward pass for all inputs
             # ───────────────────────────────────
-            z_l, logits_l = self.model(x_l)           # [B_l, D], [B_l, K]
-            loss_cls      = F.cross_entropy(logits_l, y_l)
+            # Concatenate to stabilize BatchNorm statistics (standard FixMatch practice).
+            # If passed sequentially, the strong augmentations (x_u_s) would skew the 
+            # running BN stats, ruining the ema_model's representations.
+            B_l, B_u = x_l.size(0), x_u_w.size(0)
+            x_all = torch.cat([x_l, x_u_w, x_u_s], dim=0)
+            z_all, logits_all = self.model(x_all)
 
-            # ───────────────────────────────────
-            # C. Online encoder: unlabeled weak & strong
-            # ───────────────────────────────────
-            z_u_w_online, logits_u_w = self.model(x_u_w)  # linear pseudo-label
+            z_l, logits_l = z_all[:B_l], logits_all[:B_l]
+            loss_cls = F.cross_entropy(logits_l, y_l)
 
-            # Single forward pass for strong-augmented unlabeled samples.
-            # z_u_s_online and logits_u_s are reused for BOTH loss_u and loss_c
-            # to avoid a redundant (and gradient-inconsistent) second forward pass.
-            z_u_s_online, logits_u_s = self.model(x_u_s)
+            z_u_w_online, logits_u_w = z_all[B_l:B_l+B_u], logits_all[B_l:B_l+B_u]
+            z_u_s_online, logits_u_s = z_all[B_l+B_u:], logits_all[B_l+B_u:]
 
             p_hat    = torch.softmax(logits_u_w, dim=-1)   # [B_u, K]
 
@@ -568,7 +575,7 @@ class CLAFTrainer:
                             pl_f, reduction="none") * mask).mean()
 
             # Semantic alignment loss (Lalign)
-            loss_align = semantic_alignment_loss(q_hat, logits_u_w)
+            loss_align = semantic_alignment_loss(q_sem, logits_u_w)
 
             # ───────────────────────────────────
             # D. Feature Augmentation (FA) – last FA_START% of training
@@ -591,14 +598,14 @@ class CLAFTrainer:
             # E. Build embedding queue E
             # ───────────────────────────────────
             with torch.no_grad():
-                e_l   = self.model.project(z_l_ema)             # [B_l, proj]
+                e_l   = self.ema_model.project(z_l_ema)             # [B_l, proj]
                 self.emb_queue.enqueue(e_l, y_l)
                 # lconf = 1 for labeled
                 lconf_l = torch.ones(e_l.size(0), 1, device=dev)
                 self.lconf_queue.enqueue(lconf_l, y_l)
 
                 if z_aug is not None:
-                    e_aug = self.model.project(z_aug)
+                    e_aug = self.ema_model.project(z_aug)
                     self.emb_queue.enqueue(e_aug, y_aug)
                     lconf_a = lam_aug.unsqueeze(-1)
                     self.lconf_queue.enqueue(lconf_a, y_aug)
@@ -644,6 +651,11 @@ class CLAFTrainer:
             metrics["loss_c"]     += loss_c.item() if isinstance(loss_c, torch.Tensor) else 0
             metrics["loss_align"] += loss_align.item()
 
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "cls": f"{loss_cls.item():.4f}"
+            })
+
         n = max(total, 1)
         return {k: v / n for k, v in metrics.items()}
 
@@ -671,7 +683,8 @@ class CLAFTrainer:
         all_preds  = []
         all_labels = []
 
-        for x, y in self.test_loader:
+        pbar = tqdm(self.test_loader, desc="Evaluating", leave=False)
+        for x, y in pbar:
             x = x.to(self.cfg.DEVICE)
             _, logits = self.ema_model(x)
             preds = logits.argmax(dim=-1).cpu().numpy()
@@ -733,18 +746,13 @@ class CLAFTrainer:
         os.makedirs(cfg.CKPT_DIR, exist_ok=True)
         self._init_csv_log()
 
-        # Header for per-epoch console output
-        hdr = (f"{'Ep':>4} | {'Loss':>7} {'Cls':>7} {'U':>7} {'C':>7} {'Aln':>7} | "
-               f"{'Acc%':>7} {'F1mac%':>7} {'F1wt%':>7} {'Prec%':>7} {'Rec%':>7}")
-        print("\n" + "─" * len(hdr))
-        print(hdr)
-        print("─" * len(hdr))
+        print(f"\n🚀 Starting training for {cfg.EPOCHS} epochs...\n" + "═" * 80)
 
         for epoch in range(1, cfg.EPOCHS + 1):
             # Activate feature augmentation in last (1-FA_START) fraction of training
             if epoch == fa_start_epoch + 1:
                 self.fa_active = True
-                print(f"  *** Feature Augmentation activated at epoch {epoch} ***")
+                print(f"  🌟 Feature Augmentation activated at epoch {epoch} 🌟")
 
             train_m = self._train_epoch(epoch)
             self.scheduler.step()
@@ -758,21 +766,12 @@ class CLAFTrainer:
                 best_f1 = eval_m["f1_macro"]
 
             # ── Console row ──────────────────────────────────────────────────
-            marker = " ★" if is_best else ""
-            print(
-                f"{epoch:4d} | "
-                f"{train_m['loss']:7.4f} "
-                f"{train_m['loss_cls']:7.4f} "
-                f"{train_m['loss_u']:7.4f} "
-                f"{train_m['loss_c']:7.4f} "
-                f"{train_m['loss_align']:7.4f} | "
-                f"{eval_m['accuracy']:7.2f} "
-                f"{eval_m['f1_macro']:7.2f} "
-                f"{eval_m['f1_weighted']:7.2f} "
-                f"{eval_m['precision']:7.2f} "
-                f"{eval_m['recall']:7.2f}"
-                + marker
-            )
+            marker = " ✨ [NEW BEST]" if is_best else ""
+            
+            print(f"📊 Epoch {epoch:3d}/{cfg.EPOCHS} Summary:")
+            print(f"   ├─ Train Loss : {train_m['loss']:.4f} (Cls: {train_m['loss_cls']:.4f} | U: {train_m['loss_u']:.4f} | C: {train_m['loss_c']:.4f} | Align: {train_m['loss_align']:.4f})")
+            print(f"   └─ Val Metrics: Acc: {eval_m['accuracy']:5.2f}% | F1-Mac: {eval_m['f1_macro']:5.2f}% | F1-Wt: {eval_m['f1_weighted']:5.2f}% | Prec: {eval_m['precision']:5.2f}% | Rec: {eval_m['recall']:5.2f}%{marker}")
+            print("─" * 80)
 
             # ── CSV log ──────────────────────────────────────────────────────
             self._append_csv_log(epoch, train_m, eval_m)
@@ -794,10 +793,9 @@ class CLAFTrainer:
                 if not verbose:
                     self.evaluate(verbose=True)
 
-        print("─" * len(hdr))
-        print(f"\nTraining complete.")
-        print(f"  Best macro-F1 : {best_f1:.2f}%")
-        print(f"  Best ckpt     : {cfg.SAVE_PATH}")
+        print(f"\n🎯 Training complete.")
+        print(f"   🏆 Best macro-F1 : {best_f1:.2f}%")
+        print(f"   💾 Best ckpt     : {cfg.SAVE_PATH}")
         print(f"  Latest ckpt   : {os.path.join(cfg.CKPT_DIR, 'claf_latest.pth')}")
         print(f"  Metric log    : {cfg.LOG_PATH}")
 
